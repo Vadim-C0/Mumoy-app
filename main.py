@@ -34,11 +34,13 @@ templates = Jinja2Templates(directory="templates")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mood_app")
 
-HF_MODEL_URL = "https://api-inference.huggingface.co/models/j-hartmann/emotion-english-distilroberta-base"
+# ---------------- HuggingFace model ----------------
+# High-accuracy model (GoEmotions)
+HF_MODEL_URL = "https://api-inference.huggingface.co/models/SamLowe/roberta-base-go_emotions"
 HEADERS = {
     "Authorization": f"Bearer {HF_API_KEY}",
     "Content-Type": "application/json",
-    "X-Wait-For-Model": "true"
+    "X-Wait-For-Model": "true",
 }
 
 # ---------------- In-Memory Storage ----------------
@@ -50,7 +52,42 @@ memory_lock = Lock()
 RATE_LIMIT = 5
 TIME_WINDOW = 60 * 1000  # ms
 
-# ---------------- Mood Mapping ----------------
+# ---------------- Mood Mapping (map many GO labels -> simple moods) ----------------
+# The GoEmotions model has many fine-grained labels; map them to your simple genres.
+go_to_mood = {
+    # joy/positive
+    "joy": "joy",
+    "amusement": "joy",
+    "relief": "joy",
+    "approval": "joy",
+    "excitement": "joy",
+    # love/affection
+    "admiration": "love",
+    "gratitude": "love",
+    "love": "love",
+    # anger/hostile
+    "anger": "anger",
+    "annoyance": "anger",
+    "disapproval": "anger",
+    # sadness
+    "sadness": "sadness",
+    "grief": "sadness",
+    "disappointment": "sadness",
+    # fear
+    "fear": "fear",
+    "nervousness": "fear",
+    "embarrassment": "fear",
+    # disgust
+    "disgust": "disgust",
+    "repulsion": "disgust",
+    # surprise
+    "surprise": "surprise",
+    "confusion": "surprise",
+}
+
+# Fallback mapping: if label not present, we'll keep raw label as a fallback mood.
+
+# ---------------- Mood -> genre ----------------
 mood_to_genre = {
     "anger": "metal music",
     "joy": "pop music",
@@ -62,7 +99,6 @@ mood_to_genre = {
 }
 
 # ---------------- Middleware ----------------
-
 class ForwardedHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         xff = request.headers.get("x-forwarded-for")
@@ -75,7 +111,6 @@ class ForwardedHeadersMiddleware(BaseHTTPMiddleware):
 
         return await call_next(request)
 
-
 app.add_middleware(ForwardedHeadersMiddleware)
 
 app.add_middleware(
@@ -86,17 +121,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 class HTTPSRedirectMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if request.url.scheme != "https":
+        # use forwarded proto when behind a proxy
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        if proto != "https":
             url = request.url.replace(scheme="https")
             return RedirectResponse(url)
         return await call_next(request)
 
-
 app.add_middleware(HTTPSRedirectMiddleware)
-
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -111,7 +145,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             "Content-Security-Policy": (
                 "default-src 'self'; "
                 "script-src 'self' https://www.youtube.com https://www.youtube-nocookie.com; "
-                "style-src 'self' 'unsafe-inline'; "
+                "style-src 'self'; "  # avoid 'unsafe-inline'
                 "frame-src https://www.youtube.com https://www.youtube-nocookie.com; "
                 "img-src 'self' data: https://i.ytimg.com; "
                 "connect-src 'self' https://api-inference.huggingface.co https://www.googleapis.com;"
@@ -119,9 +153,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         })
         return response
 
-
 app.add_middleware(SecurityHeadersMiddleware)
-
 
 class LimitBodySizeMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -131,14 +163,14 @@ class LimitBodySizeMiddleware(BaseHTTPMiddleware):
             return JSONResponse({"detail": "Request too large"}, status_code=413)
         return await call_next(request)
 
-
 app.add_middleware(LimitBodySizeMiddleware)
 
 # ---------------- Utilities ----------------
 
 def sanitize_input(text: str) -> str:
     text = text.strip()[:250]
-    if not re.match(r"^[\w\s.,!?'\-🌟😊]*$", text, re.UNICODE):
+    # allow common punctuation and letters/numbers; deny control chars
+    if not re.match(r"^[\w\s.,!?'\-\u00C0-\u024F]*$", text, re.UNICODE):
         raise ValueError("Invalid characters in input.")
     return html.escape(text)
 
@@ -160,15 +192,23 @@ async def is_rate_limited(key: str) -> bool:
     return False
 
 
+def _validate_video_id(video_id: str):
+    if not video_id:
+        return None
+    if re.match(r"^[A-Za-z0-9_-]{11}$", video_id):
+        return video_id
+    return None
+
+
 async def get_emotion_genre_video(mood: str):
     key = mood.lower()
 
-    # Cache check
+    # Cache
     if key in memory_cache:
         data = memory_cache[key]
         return data["emotion"], data["genre"], data["video_id"]
 
-    # ---- HuggingFace API ----
+    # HuggingFace API
     emotion = "unknown"
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -176,16 +216,24 @@ async def get_emotion_genre_video(mood: str):
             resp.raise_for_status()
             result = resp.json()
 
-            # HF returns: [ { "label": "joy", "score": 0.99 }, ... ]
+            # GoEmotions inference typically returns a list of dicts: [{"label": ..., "score": ...}, ...]
             if isinstance(result, list) and len(result) > 0 and isinstance(result[0], dict):
-                emotion = result[0].get("label", "unknown").lower()
+                # pick the label with the highest score
+                best = max(result, key=lambda x: x.get("score", 0))
+                raw_label = best.get("label", "unknown").lower()
+                # map fine-grained GO label to our simple mood
+                emotion = go_to_mood.get(raw_label, raw_label)
 
+    except httpx.HTTPStatusError as e:
+        # if model removed or disabled, surface the response for logs
+        logger.error(f"HuggingFace API status error: {e.response.status_code} {e.response.text}")
     except Exception as e:
         logger.error(f"HuggingFace API error: {e}")
 
+    # map to genre
     genre = mood_to_genre.get(emotion, "chill music")
 
-    # ---- YouTube API ----
+    # YouTube search
     video_id = None
     try:
         params = {
@@ -201,18 +249,20 @@ async def get_emotion_genre_video(mood: str):
             yt_res.raise_for_status()
             items = yt_res.json().get("items", [])
             if items and "id" in items[0] and "videoId" in items[0]["id"]:
-                video_id = items[0]["id"]["videoId"]
+                video_id = _validate_video_id(items[0]["id"]["videoId"])
 
     except Exception as e:
         logger.warning(f"YouTube API error: {e}")
 
-    # Cache result
-    memory_cache[key] = {"emotion": emotion, "genre": genre, "video_id": video_id}
+    # sanitize outputs before caching
+    safe_emotion = html.escape(emotion)
+    safe_genre = html.escape(genre)
 
-    return emotion, genre, video_id
+    memory_cache[key] = {"emotion": safe_emotion, "genre": safe_genre, "video_id": video_id}
+    return safe_emotion, safe_genre, video_id
+
 
 # ---------------- Routes ----------------
-
 @app.get("/", response_class=HTMLResponse)
 def read_root(request: Request):
     return templates.TemplateResponse("index.html", {"request": request, "video_id": None})
@@ -245,29 +295,34 @@ async def submit_mood(request: Request, mood: str = Form(...)):
 async def health_check():
     return {"status": "ok", "memory_cache": "ok"}
 
-# ---------------- Protected Docs ----------------
 
+# ---------------- Protected Docs ----------------
 security = HTTPBasic()
 
 
 def check_docs(credentials: HTTPBasicCredentials = Depends(security)):
-    if credentials.username != DOCS_USER or credentials.password != DOCS_PASS:
+    correct_user = credentials.username == DOCS_USER
+    correct_pass = credentials.password == DOCS_PASS
+    if not (correct_user and correct_pass):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 @app.get("/docs", dependencies=[Depends(check_docs)])
 async def get_docs():
     from fastapi.openapi.docs import get_swagger_ui_html
+
     return get_swagger_ui_html(openapi_url=app.openapi_url, title="Docs")
 
 
 @app.get("/redoc", dependencies=[Depends(check_docs)])
 async def get_redoc():
     from fastapi.openapi.docs import get_redoc_html
+
     return get_redoc_html(openapi_url=app.openapi_url, title="ReDoc")
 
 
 if __name__ == "__main__":
     import uvicorn
+
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
