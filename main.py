@@ -36,7 +36,7 @@ logger = logging.getLogger("mood_app")
 
 # ---------------- HuggingFace model ----------------
 # High-accuracy model (GoEmotions)
-HF_MODEL_URL = "https://api-inference.huggingface.co/models/SamLowe/roberta-base-go_emotions"
+HF_MODEL_URL = "https://router.huggingface.co/models/SamLowe/roberta-base-go_emotions"
 HEADERS = {
     "Authorization": f"Bearer {HF_API_KEY}",
     "Content-Type": "application/json",
