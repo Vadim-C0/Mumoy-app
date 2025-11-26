@@ -35,7 +35,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mood_app")
 
 # ---------------- HuggingFace model (free, stable) ----------------
-HF_MODEL_URL = "https://router.huggingface.co/models/distilbert-base-uncased-emotion"
+HF_MODEL_URL = "https://api-inference.huggingface.co/models/bhadresh-savani/distilbert-base-uncased-emotion"
 HEADERS = {
     "Authorization": f"Bearer {HF_API_KEY}",
     "Content-Type": "application/json",
