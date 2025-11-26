@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mood Music</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='styles.css') }}" />
+  </head>
+  <body>
+    <h1>Mood Music</h1>
+
+    <form method="post">
+      <input
+        type="text"
+        name="mood"
+        placeholder="How are you feeling today?"
+        required
+      />
+      <button type="submit">Play Music</button>
+    </form>
+
+    {% if video_id %}
+    <div class="result">
+      <p>Detected Emotion: <span class="emotion">{{ emotion | e }}</span></p>
+      <p>Suggested Genre: <span class="genre">{{ genre | e }}</span></p>
+
+      <div class="video-container">
+        <iframe
+          src="https://www.youtube.com/embed/{{ video_id }}?autoplay=1&mute=1"
+          title="YouTube video player"
+          allow="autoplay; encrypted-media"
+          allowfullscreen
+        ></iframe>
+      </div>
+    </div>
+    {% endif %}
+  </body>
+</html>
