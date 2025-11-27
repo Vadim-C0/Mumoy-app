@@ -1,10 +1,11 @@
 from fastapi import FastAPI, Request, Form, HTTPException, Depends
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
+
 import httpx
 import os
 import time
@@ -14,6 +15,9 @@ import re
 import html
 from collections import defaultdict
 from threading import Lock
+
+# NEW
+from huggingface_hub import AsyncInferenceClient
 
 # ---------------- Load Env ----------------
 load_dotenv()
@@ -34,13 +38,11 @@ templates = Jinja2Templates(directory="templates")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mood_app")
 
-# ---------------- HuggingFace model (free, stable) ----------------
-HF_MODEL_URL = "https://router.huggingface.co/hf-inference/models/j-hartmann/emotion-english-distilroberta-base"
-HEADERS = {
-    "Authorization": f"Bearer {HF_API_KEY}",
-    "Content-Type": "application/json",
-    "X-Wait-For-Model": "true",
-}
+# ---------------- HuggingFace Client (NEW) ----------------
+hf_client = AsyncInferenceClient(
+    model="j-hartmann/emotion-english-distilroberta-base",
+    token=HF_API_KEY,
+)
 
 # ---------------- In-Memory Storage ----------------
 memory_limiter = defaultdict(list)
@@ -60,6 +62,7 @@ go_to_mood = {
     "love": "love",
     "surprise": "surprise",
     "disgust": "disgust",
+    "neutral": "neutral",
 }
 
 mood_to_genre = {
@@ -70,9 +73,11 @@ mood_to_genre = {
     "disgust": "punk music",
     "surprise": "electronic music",
     "love": "romantic music",
+    "neutral": "chill music",
 }
 
 # ---------------- Middleware ----------------
+
 class ForwardedHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         xff = request.headers.get("x-forwarded-for")
@@ -134,12 +139,10 @@ def sanitize_input(text: str) -> str:
         raise ValueError("Invalid characters in input.")
     return html.escape(text)
 
-
 def get_client_key(request: Request) -> str:
     ip = request.headers.get("x-forwarded-for", request.client.host).split(",")[0].strip()
     ua = request.headers.get("user-agent", "unknown")
     return f"{ip}:{ua}"
-
 
 async def is_rate_limited(key: str) -> bool:
     now = int(time.time() * 1000)
@@ -151,7 +154,6 @@ async def is_rate_limited(key: str) -> bool:
         memory_limiter[key].append(now)
     return False
 
-
 def _validate_video_id(video_id: str):
     if not video_id:
         return None
@@ -160,6 +162,21 @@ def _validate_video_id(video_id: str):
     return None
 
 
+# --------------- NEW: Proper Emotion Classification ----------------
+
+async def detect_emotion(text: str) -> str:
+    try:
+        outputs = await hf_client.text_classification(text)
+        best = max(outputs, key=lambda x: x["score"])
+        label = best["label"].lower()
+        return go_to_mood.get(label, label)
+    except Exception as e:
+        logger.error(f"HuggingFace error: {e}")
+        return "unknown"
+
+
+# ---------------- Main Logic ----------------
+
 async def get_emotion_genre_video(mood: str):
     key = mood.lower()
 
@@ -167,23 +184,13 @@ async def get_emotion_genre_video(mood: str):
         data = memory_cache[key]
         return data["emotion"], data["genre"], data["video_id"]
 
-    emotion = "unknown"
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(HF_MODEL_URL, headers=HEADERS, json={"inputs": mood})
-            resp.raise_for_status()
-            result = resp.json()
+    # 1) detect emotion correctly
+    emotion = await detect_emotion(mood)
 
-            if isinstance(result, list) and len(result) > 0 and isinstance(result[0], dict):
-                best = result[0]
-                raw_label = best.get("label", "unknown").lower()
-                emotion = go_to_mood.get(raw_label, raw_label)
-
-    except Exception as e:
-        logger.error(f"HuggingFace Router API error: {e}")
-
+    # 2) map to genre
     genre = mood_to_genre.get(emotion, "chill music")
 
+    # 3) get YouTube video
     video_id = None
     try:
         params = {
@@ -200,15 +207,17 @@ async def get_emotion_genre_video(mood: str):
             items = yt_res.json().get("items", [])
             if items and "id" in items[0] and "videoId" in items[0]["id"]:
                 video_id = _validate_video_id(items[0]["id"]["videoId"])
-
     except Exception as e:
         logger.warning(f"YouTube API error: {e}")
 
-    safe_emotion = html.escape(emotion)
-    safe_genre = html.escape(genre)
+    # cache it
+    memory_cache[key] = {
+        "emotion": emotion,
+        "genre": genre,
+        "video_id": video_id
+    }
 
-    memory_cache[key] = {"emotion": safe_emotion, "genre": safe_genre, "video_id": video_id}
-    return safe_emotion, safe_genre, video_id
+    return emotion, genre, video_id
 
 # ---------------- Routes ----------------
 @app.get("/", response_class=HTMLResponse)
@@ -245,7 +254,6 @@ async def health_check():
 
 # ---------------- Protected Docs ----------------
 security = HTTPBasic()
-
 
 def check_docs(credentials: HTTPBasicCredentials = Depends(security)):
     correct_user = credentials.username == DOCS_USER
