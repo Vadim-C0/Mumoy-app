@@ -23,7 +23,7 @@ from huggingface_hub import AsyncInferenceClient
 load_dotenv()
 HF_API_KEY = os.getenv("HF_API_KEY")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
-ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "https://yourapp.onrender.com")
+ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "https://mumoy-app.onrender.com")
 DOCS_USER = os.getenv("DOCS_USER")
 DOCS_PASS = os.getenv("DOCS_PASS")
 
